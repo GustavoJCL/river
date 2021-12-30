@@ -33,6 +33,7 @@ const util = @import("util.zig");
 const Box = @import("Box.zig");
 const Config = @import("Config.zig");
 const LayerSurface = @import("LayerSurface.zig");
+const LockSurface = @import("LockSurface.zig");
 const Output = @import("Output.zig");
 const Seat = @import("Seat.zig");
 const View = @import("View.zig");
@@ -338,7 +339,6 @@ fn handleButton(listener: *wl.Listener(*wlr.Pointer.event.Button), event: *wlr.P
 fn updateKeyboardFocus(self: Self, result: SurfaceAtResult) void {
     switch (result.parent) {
         .view => |view| {
-            // Otherwise focus the view
             self.seat.focus(view);
         },
         .layer_surface => |layer_surface| {
@@ -350,6 +350,10 @@ fn updateKeyboardFocus(self: Self, result: SurfaceAtResult) void {
             } else {
                 self.seat.focus(null);
             }
+        },
+        .lock_surface => |lock_surface| {
+            assert(server.lock_manager.locked);
+            self.seat.setFocusRaw(.{ .lock_surface = lock_surface });
         },
         .xwayland_override_redirect => |override_redirect| {
             if (!build_options.xwayland) unreachable;
@@ -629,6 +633,7 @@ const SurfaceAtResult = struct {
     parent: union(enum) {
         view: *View,
         layer_surface: *LayerSurface,
+        lock_surface: *LockSurface,
         xwayland_override_redirect: if (build_options.xwayland) *XwaylandOverrideRedirect else void,
     },
 };
@@ -650,6 +655,22 @@ fn surfaceAtCoords(lx: f64, ly: f64) ?SurfaceAtResult {
     var ox = lx;
     var oy = ly;
     server.root.output_layout.outputCoords(wlr_output, &ox, &oy);
+
+    if (server.lock_manager.locked) {
+        if (output.lock_surface) |lock_surface| {
+            var sx: f64 = undefined;
+            var sy: f64 = undefined;
+            if (lock_surface.wlr_lock_surface.surface.surfaceAt(ox, oy, &sx, &sy)) |found| {
+                return SurfaceAtResult{
+                    .surface = found,
+                    .sx = sx,
+                    .sy = sy,
+                    .parent = .{ .lock_surface = lock_surface },
+                };
+            }
+        }
+        return null;
+    }
 
     // Find the first visible fullscreen view in the stack if there is one
     var it = ViewStack(View).iter(output.views.first, .forward, output.current.tags, surfaceAtFilter);
@@ -1009,7 +1030,7 @@ pub fn checkFocusFollowsCursor(self: *Self) void {
                         server.root.startTransaction();
                     }
                 },
-                .layer_surface => {},
+                .layer_surface, .lock_surface => {},
                 .xwayland_override_redirect => assert(build_options.xwayland),
             }
         }
@@ -1049,6 +1070,7 @@ fn shouldPassthrough(self: Self) bool {
             return false;
         },
         .resize, .move => {
+            assert(!server.lock_manager.locked);
             const target = if (self.mode == .resize) self.mode.resize.view else self.mode.move.view;
             // The target view is no longer visible, is part of the layout, or is fullscreen.
             return target.current.tags & target.output.current.tags == 0 or
@@ -1063,6 +1085,7 @@ fn passthrough(self: *Self, time: u32) void {
     assert(self.mode == .passthrough);
 
     if (self.surfaceAt()) |result| {
+        assert((result.parent == .lock_surface) == server.lock_manager.locked);
         self.seat.wlr_seat.pointerNotifyEnter(result.surface, result.sx, result.sy);
         self.seat.wlr_seat.pointerNotifyMotion(time, result.sx, result.sy);
     } else {
